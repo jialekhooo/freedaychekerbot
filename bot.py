@@ -11,7 +11,7 @@ from pathlib import Path
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR = Path(os.getenv("BOT_DATA_DIR", str(Path(__file__).resolve().parent / "data")))
 DATA_FILE = DATA_DIR / "storage.json"
 
 WEEKDAY_ALIASES = {
@@ -51,7 +51,7 @@ MONTH_NAME_ALIASES = {
 
 
 def ensure_storage() -> None:
-    DATA_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.exists():
         DATA_FILE.write_text(
             json.dumps({"expenses": [], "plans": [], "budgets": {}, "incomes": []}, indent=2),
