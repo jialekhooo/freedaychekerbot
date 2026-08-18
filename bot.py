@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_FILE = DATA_DIR / "storage.json"
@@ -32,6 +32,21 @@ WEEKDAY_ALIASES = {
     "saturday": 5,
     "sun": 6,
     "sunday": 6,
+}
+
+MONTH_NAME_ALIASES = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
 }
 
 
@@ -260,6 +275,57 @@ def category_totals(state: dict) -> dict:
     return dict(totals)
 
 
+def parse_month_string(value: str | None) -> tuple[int, int]:
+    today = date.today()
+    if not value or not value.strip():
+        return today.year, today.month
+
+    token = value.strip().lower()
+    if token in {"this month", "thismonth"}:
+        return today.year, today.month
+    if token in {"last month", "lastmonth"}:
+        last_month_date = today.replace(day=1) - timedelta(days=1)
+        return last_month_date.year, last_month_date.month
+
+    iso_match = re.fullmatch(r"(\d{4})-(\d{2})", token)
+    if iso_match:
+        return int(iso_match.group(1)), int(iso_match.group(2))
+
+    words = token.split()
+    month_word = words[0] if words else token
+    if month_word in MONTH_NAME_ALIASES:
+        month_num = MONTH_NAME_ALIASES[month_word]
+        year = int(words[1]) if len(words) > 1 and words[1].isdigit() else today.year
+        return year, month_num
+
+    if token.isdigit() and 1 <= int(token) <= 12:
+        return today.year, int(token)
+
+    return today.year, today.month
+
+
+def expenses_for_month(state: dict, year: int, month: int) -> list:
+    prefix = f"{year:04d}-{month:02d}"
+    return [item for item in state["expenses"] if item["date"].startswith(prefix)]
+
+
+def build_month_summary(state: dict, year: int, month: int) -> str:
+    expenses = expenses_for_month(state, year, month)
+    label = date(year, month, 1).strftime("%B %Y")
+    if not expenses:
+        return f"No expenses logged for {label}."
+
+    total = sum((Decimal(item["amount"]) for item in expenses), Decimal("0"))
+    totals = defaultdict(Decimal)
+    for item in expenses:
+        totals[item["category"].lower()] += Decimal(item["amount"])
+
+    lines = [f"{label} spending: {format_currency(total)}", "By category:"]
+    for category, amount in sorted(totals.items(), key=lambda kv: kv[1], reverse=True):
+        lines.append(f"- {category.title()}: {format_currency(amount)}")
+    return "\n".join(lines)
+
+
 def plans_for_date(state: dict, target_date: str) -> list:
     normalized = parse_date_string(target_date).isoformat()
     target = date.fromisoformat(normalized)
@@ -372,6 +438,7 @@ def format_plan_item(plan: dict) -> str:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
         "Welcome to your money + daily planner bot.\n\n"
+        "Just send a plain message like 'tomorrow 4pm gym' to add a plan - no command needed.\n\n"
         "Core commands:\n"
         "- /plan add today 2pm-4pm finish report\n"
         "- /plan add every mon 9am gym (recurring)\n"
@@ -382,6 +449,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /pay add 25 food groceries\n"
         "- /pay total\n"
         "- /budget set groceries 250\n"
+        "- /month [aug|2026-08|last month]\n"
         "- /summary\n"
         "- /commands\n"
         "- /help"
@@ -396,6 +464,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = [
         "All commands:",
+        "Plain message (no command) - quick-add a plan, e.g. 'fri 3pm dentist'",
         "/plan add <text> - add a plan (supports today/tomorrow/weekday, time ranges, 'every mon')",
         "/plan list - show every plan",
         "/plan done <id> - mark a plan done",
@@ -410,6 +479,7 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "/income list - recent income",
         "/budget set <category> <amount> - set a budget",
         "/budget list - show budgets vs spending",
+        "/month [aug|2026-08|last month] - monthly spending by category",
         "/export - CSV export of expenses",
         "/reminders on|off|07:30 [+8] - daily agenda + heads-up before plans",
         "/summary - daily overview of money + plans",
@@ -671,6 +741,23 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(summary_text(state, date.today().isoformat()))
 
 
+async def month_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    value = " ".join(context.args) if context.args else None
+    year, month = parse_month_string(value)
+    await update.message.reply_text(build_month_summary(state, year, month))
+
+
+async def plain_text_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = update.message.text
+    if not text or not text.strip():
+        return
+    state = load_state()
+    plan = add_plan(state, text)
+    save_state(state)
+    await update.message.reply_text(f"Added plan: {format_plan_item(plan)}")
+
+
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
     if not state["expenses"]:
@@ -776,11 +863,13 @@ def main() -> None:
     app.add_handler(CommandHandler("income", income_command))
     app.add_handler(CommandHandler("budget", budget_command))
     app.add_handler(CommandHandler("summary", summary_command))
+    app.add_handler(CommandHandler("month", month_command))
     app.add_handler(CommandHandler("commands", commands_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("reminders", reminders_command))
     app.add_handler(CommandHandler("tasks", plan_command))
     app.add_handler(CommandHandler("todo", plan_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, plain_text_plan))
 
     if app.job_queue is not None:
         app.job_queue.run_repeating(reminder_job, interval=60, first=10)

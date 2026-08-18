@@ -7,7 +7,9 @@ A Telegram bot that combines daily task planning with personal pay tracking in o
 - Track expenses and income, with per-category budgets
 - Review spending totals and recent entries
 - Add, complete, and list daily plans (one-off or recurring)
+- Quick-add a plan by just sending a plain message, no command needed
 - `/today` and `/week` views of upcoming plans
+- `/month` spending breakdown by category
 - CSV export of expenses
 - Daily agenda + per-plan heads-up reminders
 - See a quick summary of both finance and plan status
@@ -29,6 +31,7 @@ A Telegram bot that combines daily task planning with personal pay tracking in o
 
 - `/start` / `/help` - Show bot welcome screen
 - `/commands` - Full command reference
+- Plain message (no command) - quick-add a plan, e.g. `fri 3pm dentist`
 - `/plan add today 2pm-4pm finish report` - Add a plan
 - `/plan add every mon 9am gym` - Add a recurring plan
 - `/plan list` - List all plans
@@ -40,6 +43,7 @@ A Telegram bot that combines daily task planning with personal pay tracking in o
 - `/pay list` / `/pay total` / `/pay delete 1`
 - `/income add 600 salary monthly` - Log income
 - `/budget set groceries 250` - Set a budget
+- `/month [aug|2026-08|last month]` - Monthly spending by category
 - `/export` - CSV export of expenses
 - `/reminders on|off|07:30 [+8]` - Daily agenda + heads-up before plans
 - `/summary` - Combined money + plan overview

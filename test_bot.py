@@ -6,8 +6,10 @@ from bot import (
     add_plan,
     build_agenda_message,
     build_expenses_csv,
+    build_month_summary,
     get_reminder_settings,
     parse_clock_time,
+    parse_month_string,
     plans_for_date,
     plans_starting_soon,
     set_budget,
@@ -90,3 +92,26 @@ def test_build_agenda_message_and_csv_export():
     assert "gym" in agenda
     assert "transport" in csv_text
     assert "12" in csv_text
+
+
+def test_parse_month_string_variants():
+    today = date.today()
+    assert parse_month_string(None) == (today.year, today.month)
+    assert parse_month_string("2026-08") == (2026, 8)
+    assert parse_month_string("aug") == (today.year, 8)
+    assert parse_month_string("August 2025") == (2025, 8)
+
+
+def test_build_month_summary_groups_by_category():
+    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
+    add_expense(state, 20, "food", "lunch", expense_date="2026-08-05")
+    add_expense(state, 30, "food", "dinner", expense_date="2026-08-10")
+    add_expense(state, 15, "transport", "bus", expense_date="2026-08-12")
+    add_expense(state, 99, "food", "out of month", expense_date="2026-07-01")
+
+    summary = build_month_summary(state, 2026, 8)
+
+    assert "August 2026" in summary
+    assert "$65.00" in summary
+    assert "Food: $50.00" in summary
+    assert "Transport: $15.00" in summary
