@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import os
 import re
@@ -114,6 +116,24 @@ def parse_time_value(raw: str) -> str:
     if re.fullmatch(r"\d{1,2}", text):
         return text
     return text
+
+
+def parse_clock_time(raw: str) -> tuple[int, int] | None:
+    text = raw.strip().lower().replace(" ", "").replace(".", ":")
+    match = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(am|pm)?", text)
+    if not match:
+        return None
+
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
+    meridian = match.group(3)
+    if meridian == "pm" and hour != 12:
+        hour += 12
+    if meridian == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour < 24 and 0 <= minute < 60):
+        return None
+    return hour, minute
 
 
 def parse_plan_text(raw_text: str) -> dict:
@@ -256,6 +276,62 @@ def plans_for_date(state: dict, target_date: str) -> list:
     return matches
 
 
+def get_reminder_settings(state: dict, chat_id: int | str) -> dict:
+    reminders = state.setdefault("reminders", {})
+    return reminders.setdefault(str(chat_id), {"enabled": False, "time": "08:00", "tz_offset": 8, "reminded_today": {}})
+
+
+def set_reminder_enabled(state: dict, chat_id: int | str, enabled: bool) -> dict:
+    cfg = get_reminder_settings(state, chat_id)
+    cfg["enabled"] = enabled
+    return cfg
+
+
+def set_reminder_time(state: dict, chat_id: int | str, time_str: str, tz_offset: int | None = None) -> dict:
+    cfg = get_reminder_settings(state, chat_id)
+    cfg["time"] = time_str
+    cfg["enabled"] = True
+    if tz_offset is not None:
+        cfg["tz_offset"] = tz_offset
+    return cfg
+
+
+def local_time_for_offset(tz_offset: int) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(hours=tz_offset)
+
+
+def plans_starting_soon(plans: list, local_now: datetime, window_minutes: int = 30) -> list:
+    due = []
+    for plan in plans:
+        if plan["done"] or not plan.get("start_time"):
+            continue
+        parsed = parse_clock_time(plan["start_time"])
+        if not parsed:
+            continue
+        plan_dt = local_now.replace(hour=parsed[0], minute=parsed[1], second=0, microsecond=0)
+        delta_minutes = (plan_dt - local_now).total_seconds() / 60
+        if 0 <= delta_minutes <= window_minutes:
+            due.append(plan)
+    return due
+
+
+def build_agenda_message(plans: list) -> str:
+    if not plans:
+        return "Good morning! Nothing on today's agenda."
+    lines = ["Good morning! Today's agenda:"]
+    lines.extend(format_plan_item(plan) for plan in plans)
+    return "\n".join(lines)
+
+
+def build_expenses_csv(state: dict) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "date", "amount", "category", "note"])
+    for item in state["expenses"]:
+        writer.writerow([item["id"], item["date"], item["amount"], item["category"], item["note"]])
+    return output.getvalue()
+
+
 def summary_text(state: dict, target_date: str | None = None) -> str:
     today_value = parse_date_string(target_date).isoformat() if target_date else date.today().isoformat()
     expense_total = total_expenses(state)
@@ -334,6 +410,8 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "/income list - recent income",
         "/budget set <category> <amount> - set a budget",
         "/budget list - show budgets vs spending",
+        "/export - CSV export of expenses",
+        "/reminders on|off|07:30 [+8] - daily agenda + heads-up before plans",
         "/summary - daily overview of money + plans",
     ]
     await update.message.reply_text("\n".join(lines))
@@ -593,6 +671,92 @@ async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(summary_text(state, date.today().isoformat()))
 
 
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    if not state["expenses"]:
+        await update.message.reply_text("No expenses to export yet.")
+        return
+    csv_text = build_expenses_csv(state)
+    buffer = io.BytesIO(csv_text.encode("utf-8"))
+    buffer.name = "expenses.csv"
+    await update.message.reply_document(document=buffer, filename="expenses.csv", caption="Expense export")
+
+
+async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    chat_id = update.effective_chat.id
+    args = context.args
+
+    if not args:
+        cfg = get_reminder_settings(state, chat_id)
+        status = "on" if cfg["enabled"] else "off"
+        await update.message.reply_text(
+            f"Reminders are {status}. Time: {cfg['time']} (UTC{cfg['tz_offset']:+d}).\n"
+            "Usage: /reminders on|off|07:30 [+8]"
+        )
+        return
+
+    token = args[0].lower()
+    if token == "on":
+        set_reminder_enabled(state, chat_id, True)
+        save_state(state)
+        await update.message.reply_text("Reminders turned on.")
+        return
+
+    if token == "off":
+        set_reminder_enabled(state, chat_id, False)
+        save_state(state)
+        await update.message.reply_text("Reminders turned off.")
+        return
+
+    parsed_time = parse_clock_time(token)
+    if not parsed_time:
+        await update.message.reply_text("Usage: /reminders on|off|07:30 [+8]")
+        return
+
+    tz_offset = None
+    if len(args) > 1:
+        try:
+            tz_offset = int(args[1].replace("+", ""))
+        except ValueError:
+            tz_offset = None
+
+    time_str = f"{parsed_time[0]:02d}:{parsed_time[1]:02d}"
+    set_reminder_time(state, chat_id, time_str, tz_offset)
+    save_state(state)
+    await update.message.reply_text(f"Reminders set for {time_str} daily.")
+
+
+async def reminder_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = load_state()
+    changed = False
+
+    for chat_id, cfg in state.get("reminders", {}).items():
+        if not cfg.get("enabled"):
+            continue
+
+        local_now = local_time_for_offset(cfg.get("tz_offset", 8))
+        today_iso = local_now.date().isoformat()
+        todays_plans = plans_for_date(state, today_iso)
+
+        if local_now.strftime("%H:%M") == cfg.get("time", "08:00") and cfg.get("last_agenda_date") != today_iso:
+            await context.bot.send_message(chat_id=int(chat_id), text=build_agenda_message(todays_plans))
+            cfg["last_agenda_date"] = today_iso
+            changed = True
+
+        reminded_today = cfg.setdefault("reminded_today", {})
+        for plan in plans_starting_soon(todays_plans, local_now):
+            plan_key = str(plan["id"])
+            if reminded_today.get(plan_key) == today_iso:
+                continue
+            await context.bot.send_message(chat_id=int(chat_id), text=f"Heads up soon: {format_plan_item(plan)}")
+            reminded_today[plan_key] = today_iso
+            changed = True
+
+    if changed:
+        save_state(state)
+
+
 def main() -> None:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -613,8 +777,13 @@ def main() -> None:
     app.add_handler(CommandHandler("budget", budget_command))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("commands", commands_command))
+    app.add_handler(CommandHandler("export", export_command))
+    app.add_handler(CommandHandler("reminders", reminders_command))
     app.add_handler(CommandHandler("tasks", plan_command))
     app.add_handler(CommandHandler("todo", plan_command))
+
+    if app.job_queue is not None:
+        app.job_queue.run_repeating(reminder_job, interval=60, first=10)
 
     print("Bot started. Press Ctrl+C to stop.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
