@@ -3,7 +3,6 @@ import io
 import json
 import os
 import re
-from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -54,7 +53,7 @@ def ensure_storage() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DATA_FILE.exists():
         DATA_FILE.write_text(
-            json.dumps({"expenses": [], "plans": [], "budgets": {}, "incomes": []}, indent=2),
+            json.dumps({"shifts": [], "plans": [], "default_rate": None}, indent=2),
             encoding="utf-8",
         )
 
@@ -65,12 +64,11 @@ def load_state() -> dict:
         with DATA_FILE.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
     except (json.JSONDecodeError, OSError):
-        data = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
+        data = {"shifts": [], "plans": [], "default_rate": None}
 
-    data.setdefault("expenses", [])
+    data.setdefault("shifts", [])
     data.setdefault("plans", [])
-    data.setdefault("budgets", {})
-    data.setdefault("incomes", [])
+    data.setdefault("default_rate", None)
     return data
 
 
@@ -109,9 +107,15 @@ def parse_date_string(value: str | None) -> date:
             next_day = today + timedelta(days=delta or 7)
             return next_day
 
-    for fmt in ("%d/%m/%Y", "%d/%m", "%d-%m-%Y", "%d-%m", "%Y-%m-%d"):
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d"):
         try:
             return datetime.strptime(value.strip(), fmt).date()
+        except ValueError:
+            continue
+
+    for fmt in ("%d/%m", "%d-%m"):
+        try:
+            return datetime.strptime(value.strip(), fmt).date().replace(year=today.year)
         except ValueError:
             continue
 
@@ -226,53 +230,132 @@ def delete_plan(state: dict, plan_id: int) -> bool:
     return len(state["plans"]) != before
 
 
-def add_expense(state: dict, amount: Decimal, category: str, note: str, expense_date: str | None = None) -> dict:
-    expense_id = len(state["expenses"]) + 1
-    state["expenses"].append(
-        {
-            "id": expense_id,
-            "amount": str(amount),
-            "category": category.lower(),
-            "note": note,
-            "date": expense_date or date.today().isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+def parse_rate_value(text: str) -> Decimal | None:
+    match = re.search(r"(?i)\$?(\d+(?:\.\d+)?)\s*(?:/\s*h(?:r|our)?|per\s*hour)", text)
+    if not match:
+        return None
+    return Decimal(match.group(1))
+
+
+def parse_shift_text(raw_text: str, default_rate: Decimal | None) -> dict:
+    text = raw_text.strip()
+
+    location = None
+    loc_match = re.search(r"(?i)\s+(?:@|at)\s+(.+)$", text)
+    if loc_match:
+        location = loc_match.group(1).strip()
+        text = text[: loc_match.start()]
+
+    rate = None
+    rate_match = re.search(r"(?i)\$?(\d+(?:\.\d+)?)\s*(?:/\s*h(?:r|our)?|per\s*hour)", text)
+    if rate_match:
+        rate = Decimal(rate_match.group(1))
+        text = text[: rate_match.start()] + " " + text[rate_match.end() :]
+
+    date_value = date.today().isoformat()
+    for match in re.finditer(r"(?i)\b(today|tomorrow|mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday|next\s+(?:mon|monday|tue|tues|tuesday|wed|wednesday|thu|thur|thurs|thursday|fri|friday|sat|saturday|sun|sunday)|\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?|\d{4}-\d{2}-\d{2})\b", text):
+        date_value = parse_date_string(match.group(0)).isoformat()
+        text = text[: match.start()] + " " + text[match.end() :]
+        break
+
+    start_hm = None
+    end_hm = None
+    time_range_match = re.search(
+        r"(?i)(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)\s*(?:-|to)\s*(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)",
+        text,
     )
-    return state
+    if time_range_match:
+        start_hm = parse_clock_time(time_range_match.group(1))
+        end_hm = parse_clock_time(time_range_match.group(2))
+        text = text[: time_range_match.start()] + " " + text[time_range_match.end() :]
+
+    name = re.sub(r"\s+", " ", text).strip() or "Shift"
+    return {
+        "date": date_value,
+        "start_hm": start_hm,
+        "end_hm": end_hm,
+        "rate": rate if rate is not None else default_rate,
+        "name": name,
+        "location": location,
+    }
 
 
-def add_income(state: dict, amount: Decimal, source: str, note: str = "") -> dict:
-    income_id = len(state["incomes"]) + 1
-    state["incomes"].append(
-        {
-            "id": income_id,
-            "amount": str(amount),
-            "source": source,
-            "note": note,
-            "date": date.today().isoformat(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        }
+def compute_shift_hours(start_hm: tuple[int, int] | None, end_hm: tuple[int, int] | None) -> Decimal:
+    if not start_hm or not end_hm:
+        return Decimal("0")
+    start_minutes = start_hm[0] * 60 + start_hm[1]
+    end_minutes = end_hm[0] * 60 + end_hm[1]
+    if end_minutes <= start_minutes:
+        end_minutes += 24 * 60
+    return Decimal(end_minutes - start_minutes) / Decimal(60)
+
+
+def add_shift(state: dict, parsed: dict) -> dict:
+    hours = compute_shift_hours(parsed["start_hm"], parsed["end_hm"])
+    pay = (hours * parsed["rate"]).quantize(Decimal("0.01"))
+    shift_id = len(state["shifts"]) + 1
+    shift = {
+        "id": shift_id,
+        "date": parsed["date"],
+        "start_time": f"{parsed['start_hm'][0]:02d}:{parsed['start_hm'][1]:02d}",
+        "end_time": f"{parsed['end_hm'][0]:02d}:{parsed['end_hm'][1]:02d}",
+        "rate": str(parsed["rate"]),
+        "hours": str(hours),
+        "pay": str(pay),
+        "name": parsed["name"],
+        "location": parsed.get("location") or "",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    state["shifts"].append(shift)
+    return shift
+
+
+def format_shift_item(shift: dict) -> str:
+    location = f" @ {shift['location']}" if shift.get("location") else ""
+    return (
+        f"#{shift['id']} {shift['date']} {shift['start_time']}-{shift['end_time']} "
+        f"{shift['name']}{location} \u2014 {shift['hours']}h @ {format_currency(Decimal(shift['rate']))}/h "
+        f"= {format_currency(Decimal(shift['pay']))}"
     )
-    return state
 
 
-def set_budget(state: dict, category: str, amount: Decimal) -> None:
-    state["budgets"][category.lower()] = str(amount)
+def get_default_rate(state: dict) -> Decimal | None:
+    rate = state.get("default_rate")
+    return Decimal(rate) if rate else None
 
 
-def total_expenses(state: dict) -> Decimal:
-    return sum((Decimal(item["amount"]) for item in state["expenses"]), Decimal("0"))
+def set_default_rate(state: dict, amount: Decimal) -> None:
+    state["default_rate"] = str(amount)
 
 
-def total_income(state: dict) -> Decimal:
-    return sum((Decimal(item["amount"]) for item in state["incomes"]), Decimal("0"))
+def total_pay(state: dict) -> Decimal:
+    return sum((Decimal(item["pay"]) for item in state["shifts"]), Decimal("0"))
 
 
-def category_totals(state: dict) -> dict:
-    totals = defaultdict(Decimal)
-    for item in state["expenses"]:
-        totals[item["category"].lower()] += Decimal(item["amount"])
-    return dict(totals)
+def shifts_for_month(state: dict, year: int, month: int) -> list:
+    prefix = f"{year:04d}-{month:02d}"
+    return [item for item in state["shifts"] if item["date"].startswith(prefix)]
+
+
+def build_shifts_csv(state: dict) -> str:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["id", "date", "start", "end", "name", "location", "rate", "hours", "pay"])
+    for item in state["shifts"]:
+        writer.writerow(
+            [
+                item["id"],
+                item["date"],
+                item["start_time"],
+                item["end_time"],
+                item["name"],
+                item["location"],
+                item["rate"],
+                item["hours"],
+                item["pay"],
+            ]
+        )
+    return output.getvalue()
 
 
 def parse_month_string(value: str | None) -> tuple[int, int]:
@@ -304,25 +387,17 @@ def parse_month_string(value: str | None) -> tuple[int, int]:
     return today.year, today.month
 
 
-def expenses_for_month(state: dict, year: int, month: int) -> list:
-    prefix = f"{year:04d}-{month:02d}"
-    return [item for item in state["expenses"] if item["date"].startswith(prefix)]
-
-
 def build_month_summary(state: dict, year: int, month: int) -> str:
-    expenses = expenses_for_month(state, year, month)
+    shifts = shifts_for_month(state, year, month)
     label = date(year, month, 1).strftime("%B %Y")
-    if not expenses:
-        return f"No expenses logged for {label}."
+    if not shifts:
+        return f"No shifts logged for {label}."
 
-    total = sum((Decimal(item["amount"]) for item in expenses), Decimal("0"))
-    totals = defaultdict(Decimal)
-    for item in expenses:
-        totals[item["category"].lower()] += Decimal(item["amount"])
+    total_hours = sum((Decimal(item["hours"]) for item in shifts), Decimal("0"))
+    total_pay_amount = sum((Decimal(item["pay"]) for item in shifts), Decimal("0"))
 
-    lines = [f"{label} spending: {format_currency(total)}", "By category:"]
-    for category, amount in sorted(totals.items(), key=lambda kv: kv[1], reverse=True):
-        lines.append(f"- {category.title()}: {format_currency(amount)}")
+    lines = [f"{label}: {format_currency(total_pay_amount)} across {total_hours}h ({len(shifts)} shifts)", ""]
+    lines.extend(format_shift_item(item) for item in shifts)
     return "\n".join(lines)
 
 
@@ -389,39 +464,23 @@ def build_agenda_message(plans: list) -> str:
     return "\n".join(lines)
 
 
-def build_expenses_csv(state: dict) -> str:
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["id", "date", "amount", "category", "note"])
-    for item in state["expenses"]:
-        writer.writerow([item["id"], item["date"], item["amount"], item["category"], item["note"]])
-    return output.getvalue()
-
-
 def summary_text(state: dict, target_date: str | None = None) -> str:
     today_value = parse_date_string(target_date).isoformat() if target_date else date.today().isoformat()
-    expense_total = total_expenses(state)
-    income_total = total_income(state)
-    net = income_total - expense_total
+    today = date.fromisoformat(today_value)
+    month_shifts = shifts_for_month(state, today.year, today.month)
+    month_pay = sum((Decimal(item["pay"]) for item in month_shifts), Decimal("0"))
+    month_hours = sum((Decimal(item["hours"]) for item in month_shifts), Decimal("0"))
+    all_time_pay = total_pay(state)
     open_today = sum(1 for item in plans_for_date(state, today_value) if not item["done"])
     done_today = sum(1 for item in plans_for_date(state, today_value) if item["done"])
     all_open = sum(1 for item in state["plans"] if not item["done"])
-    budget_lines = []
-    for category, limit in state.get("budgets", {}).items():
-        spent = category_totals(state).get(category, Decimal("0"))
-        remaining = Decimal(limit) - spent
-        budget_lines.append(f"- {category.title()}: {format_currency(spent)} / {format_currency(Decimal(limit))} left {format_currency(remaining)}")
 
-    budget_block = "\n".join(budget_lines) if budget_lines else "- No budgets set yet. Use /budget set groceries 250"
     return (
         "Daily overview:\n"
-        f"- Net cash: {format_currency(net)}\n"
-        f"- Expenses: {format_currency(expense_total)}\n"
-        f"- Income: {format_currency(income_total)}\n"
+        f"- This month's pay: {format_currency(month_pay)} ({month_hours}h, {len(month_shifts)} shifts)\n"
+        f"- All-time pay: {format_currency(all_time_pay)}\n"
         f"- Planned today: {open_today} open, {done_today} done\n"
-        f"- All open plans: {all_open}\n"
-        "- Budgets:\n"
-        f"{budget_block}"
+        f"- All open plans: {all_open}"
     )
 
 
@@ -437,7 +496,7 @@ def format_plan_item(plan: dict) -> str:
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     help_text = (
-        "Welcome to your money + daily planner bot.\n\n"
+        "Welcome to your pay + daily planner bot.\n\n"
         "Just send a plain message like 'tomorrow 4pm gym' to add a plan - no command needed.\n\n"
         "Core commands:\n"
         "- /plan add today 2pm-4pm finish report\n"
@@ -446,9 +505,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "- /plan done 1\n"
         "- /today\n"
         "- /week\n"
-        "- /pay add 25 food groceries\n"
+        "- /pay add 13/8 8.30am-8pm 15/h Wedding gig @ MBS\n"
+        "- /pay rate 15\n"
         "- /pay total\n"
-        "- /budget set groceries 250\n"
         "- /month [aug|2026-08|last month]\n"
         "- /summary\n"
         "- /commands\n"
@@ -471,18 +530,15 @@ async def commands_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "/plan delete <id> - remove a plan",
         "/today - today's plans",
         "/week - next 7 days of plans",
-        "/pay add <amount> <category> <note> - log an expense",
-        "/pay list - recent expenses",
-        "/pay total - total spending",
-        "/pay delete <id> - remove an expense",
-        "/income add <amount> <source> [note] - log income",
-        "/income list - recent income",
-        "/budget set <category> <amount> - set a budget",
-        "/budget list - show budgets vs spending",
-        "/month [aug|2026-08|last month] - monthly spending by category",
-        "/export - CSV export of expenses",
+        "/pay add <shift line> - log a shift, e.g. '13/8 8.30am-8pm 15/h Wedding gig @ MBS'",
+        "/pay list - recent shifts",
+        "/pay total [month] - total pay for a month (default: this month)",
+        "/pay rate 15 - set your default hourly rate",
+        "/pay delete <id> - remove a shift",
+        "/month [aug|2026-08|last month] - monthly pay breakdown",
+        "/export - CSV export of shifts",
         "/reminders on|off|07:30 [+8] - daily agenda + heads-up before plans",
-        "/summary - daily overview of money + plans",
+        "/summary - daily overview of pay + plans",
     ]
     await update.message.reply_text("\n".join(lines))
 
@@ -563,7 +619,7 @@ async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     today_value = date.today().isoformat()
     plans = plans_for_date(state, today_value)
     if not plans:
-        message = "Today is clear.\n- No plans scheduled.\n- Spend total: " + format_currency(total_expenses(state))
+        message = "Today is clear.\n- No plans scheduled.\n- All-time pay: " + format_currency(total_pay(state))
         await update.message.reply_text(message)
         return
 
@@ -599,45 +655,70 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not args:
         await update.message.reply_text(
             "Usage:\n"
-            "- /pay add 25 food groceries\n"
+            "- /pay add 13/8 8.30am-8pm 15/h Wedding gig @ Marina Bay Sands\n"
             "- /pay list\n"
-            "- /pay total\n"
-            "- /pay delete 1\n"
-            "- /income add 600 salary monthly"
+            "- /pay total [month]\n"
+            "- /pay rate 15\n"
+            "- /pay delete 1"
         )
         return
 
     action = args[0].lower()
 
     if action == "add":
-        if len(args) < 4:
-            await update.message.reply_text("Usage: /pay add 25 food groceries")
+        text = " ".join(args[1:])
+        if not text:
+            await update.message.reply_text("Usage: /pay add 13/8 8.30am-8pm 15/h Wedding gig @ Marina Bay Sands")
+            return
+
+        default_rate = get_default_rate(state)
+        parsed = parse_shift_text(text, default_rate)
+
+        if not parsed["start_hm"] or not parsed["end_hm"]:
+            await update.message.reply_text("Couldn't find a time range, e.g. 8.30am-8pm.")
+            return
+
+        if parsed["rate"] is None:
+            await update.message.reply_text(
+                "No rate given and no default rate set. Use /pay rate 15, or include a rate like '15/h' in the line."
+            )
+            return
+
+        shift = add_shift(state, parsed)
+        save_state(state)
+        await update.message.reply_text(f"Logged shift: {format_shift_item(shift)}")
+        return
+
+    if action == "list":
+        if not state["shifts"]:
+            await update.message.reply_text("No shifts logged yet.")
+            return
+        lines = ["Recent shifts:"]
+        for item in reversed(state["shifts"]):
+            lines.append(format_shift_item(item))
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    if action in {"total", "earnings"}:
+        value = " ".join(args[1:]) if len(args) > 1 else None
+        year, month = parse_month_string(value)
+        await update.message.reply_text(build_month_summary(state, year, month))
+        return
+
+    if action == "rate":
+        if len(args) < 2:
+            current = get_default_rate(state)
+            message = f"Default rate: {format_currency(current)}/h" if current is not None else "No default rate set. Use /pay rate 15."
+            await update.message.reply_text(message)
             return
         try:
             amount = Decimal(args[1])
         except InvalidOperation:
-            await update.message.reply_text("Amount must be a valid number, e.g. 25 or 14.75")
+            await update.message.reply_text("Rate must be a valid number, e.g. 15 or 17.50")
             return
-        category = args[2]
-        note = " ".join(args[3:])
-        add_expense(state, amount, category, note)
+        set_default_rate(state, amount)
         save_state(state)
-        await update.message.reply_text(f"Added expense: {format_currency(amount)} for {category} - {note}")
-        return
-
-    if action == "list":
-        expenses = state["expenses"]
-        if not expenses:
-            await update.message.reply_text("No expenses logged yet.")
-            return
-        lines = ["Recent expenses:"]
-        for item in reversed(expenses):
-            lines.append(f"#{item['id']} {item['date']} {format_currency(Decimal(item['amount']))} | {item['category']} | {item['note']}")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    if action == "total":
-        await update.message.reply_text(f"Total spending: {format_currency(total_expenses(state))}")
+        await update.message.reply_text(f"Default rate set to {format_currency(amount)}/h")
         return
 
     if action == "delete":
@@ -645,95 +726,20 @@ async def pay_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text("Usage: /pay delete 1")
             return
         try:
-            expense_id = int(args[1])
+            shift_id = int(args[1])
         except ValueError:
-            await update.message.reply_text("Expense ID must be a number.")
+            await update.message.reply_text("Shift ID must be a number.")
             return
-        remaining = [item for item in state["expenses"] if item["id"] != expense_id]
-        if len(remaining) == len(state["expenses"]):
-            await update.message.reply_text(f"No expense found with ID {expense_id}.")
+        remaining = [item for item in state["shifts"] if item["id"] != shift_id]
+        if len(remaining) == len(state["shifts"]):
+            await update.message.reply_text(f"No shift found with ID {shift_id}.")
             return
-        state["expenses"] = remaining
+        state["shifts"] = remaining
         save_state(state)
-        await update.message.reply_text(f"Removed expense #{expense_id}.")
+        await update.message.reply_text(f"Removed shift #{shift_id}.")
         return
 
-    await update.message.reply_text("Unknown pay command. Try /pay add, /pay list, /pay total or /pay delete.")
-
-
-async def income_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = load_state()
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage: /income add 600 salary monthly")
-        return
-    action = args[0].lower()
-    if action == "add":
-        if len(args) < 3:
-            await update.message.reply_text("Usage: /income add 600 salary monthly")
-            return
-        try:
-            amount = Decimal(args[1])
-        except InvalidOperation:
-            await update.message.reply_text("Income amount must be a valid number.")
-            return
-        source = args[2]
-        note = " ".join(args[3:]) if len(args) > 3 else ""
-        add_income(state, amount, source, note)
-        save_state(state)
-        await update.message.reply_text(f"Added income: {format_currency(amount)} from {source}")
-        return
-    if action == "list":
-        incomes = state["incomes"]
-        if not incomes:
-            await update.message.reply_text("No income logged yet.")
-            return
-        lines = ["Income records:"]
-        for item in reversed(incomes):
-            lines.append(f"#{item['id']} {item['date']} {format_currency(Decimal(item['amount']))} | {item['source']} | {item['note']}")
-        await update.message.reply_text("\n".join(lines))
-        return
-    await update.message.reply_text("Unknown income command. Try /income add or /income list.")
-
-
-async def budget_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    state = load_state()
-    args = context.args
-    if not args:
-        await update.message.reply_text("Usage:\n- /budget set groceries 250\n- /budget list")
-        return
-
-    action = args[0].lower()
-    if action == "set":
-        if len(args) < 3:
-            await update.message.reply_text("Usage: /budget set groceries 250")
-            return
-        category = args[1]
-        try:
-            amount = Decimal(args[2])
-        except InvalidOperation:
-            await update.message.reply_text("Budget amount must be a valid number.")
-            return
-        set_budget(state, category, amount)
-        save_state(state)
-        await update.message.reply_text(f"Set budget for {category}: {format_currency(amount)}")
-        return
-
-    if action == "list":
-        budgets = state.get("budgets", {})
-        if not budgets:
-            await update.message.reply_text("No budgets tracked yet.")
-            return
-        lines = ["Budgets:"]
-        totals = category_totals(state)
-        for name, limit in budgets.items():
-            spent = totals.get(name, Decimal("0"))
-            remaining = Decimal(limit) - spent
-            lines.append(f"- {name.title()}: {format_currency(spent)} / {format_currency(Decimal(limit))} (left {format_currency(remaining)})")
-        await update.message.reply_text("\n".join(lines))
-        return
-
-    await update.message.reply_text("Unknown budget command. Try /budget set or /budget list.")
+    await update.message.reply_text("Unknown pay command. Try /pay add, /pay list, /pay total, /pay rate or /pay delete.")
 
 
 async def summary_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -760,13 +766,13 @@ async def plain_text_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = load_state()
-    if not state["expenses"]:
-        await update.message.reply_text("No expenses to export yet.")
+    if not state["shifts"]:
+        await update.message.reply_text("No shifts to export yet.")
         return
-    csv_text = build_expenses_csv(state)
+    csv_text = build_shifts_csv(state)
     buffer = io.BytesIO(csv_text.encode("utf-8"))
-    buffer.name = "expenses.csv"
-    await update.message.reply_document(document=buffer, filename="expenses.csv", caption="Expense export")
+    buffer.name = "shifts.csv"
+    await update.message.reply_document(document=buffer, filename="shifts.csv", caption="Shift export")
 
 
 async def reminders_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -859,9 +865,7 @@ def main() -> None:
     app.add_handler(CommandHandler("day", today_command))
     app.add_handler(CommandHandler("week", week_command))
     app.add_handler(CommandHandler("pay", pay_command))
-    app.add_handler(CommandHandler("expense", pay_command))
-    app.add_handler(CommandHandler("income", income_command))
-    app.add_handler(CommandHandler("budget", budget_command))
+    app.add_handler(CommandHandler("shift", pay_command))
     app.add_handler(CommandHandler("summary", summary_command))
     app.add_handler(CommandHandler("month", month_command))
     app.add_handler(CommandHandler("commands", commands_command))

@@ -2,41 +2,90 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from bot import (
-    add_expense,
     add_plan,
+    add_shift,
     build_agenda_message,
-    build_expenses_csv,
     build_month_summary,
+    build_shifts_csv,
+    get_default_rate,
     get_reminder_settings,
     parse_clock_time,
     parse_month_string,
+    parse_shift_text,
     plans_for_date,
     plans_starting_soon,
-    set_budget,
+    set_default_rate,
     set_reminder_time,
     summary_text,
-    total_expenses,
+    total_pay,
 )
 
 
-def test_combined_summary_and_budget_logic():
-    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
+def make_state():
+    return {"shifts": [], "plans": [], "default_rate": None}
 
-    add_expense(state, 25.5, "food", "groceries")
+
+def test_parse_shift_text_computes_rate_date_and_location():
+    parsed = parse_shift_text("13/8 8am-8pm 15/h Wedding gig @ Marina Bay Sands", default_rate=None)
+
+    assert parsed["date"] == "2026-08-13"
+    assert parsed["start_hm"] == (8, 0)
+    assert parsed["end_hm"] == (20, 0)
+    assert parsed["rate"] == Decimal("15")
+    assert parsed["name"] == "Wedding gig"
+    assert parsed["location"] == "Marina Bay Sands"
+
+
+def test_parse_shift_text_falls_back_to_default_rate():
+    parsed = parse_shift_text("today 9am-5pm Roadshow", default_rate=Decimal("20"))
+
+    assert parsed["rate"] == Decimal("20")
+
+
+def test_add_shift_computes_hours_and_pay():
+    state = make_state()
+    parsed = parse_shift_text("13/8 8am-8pm 15/h Wedding gig", default_rate=None)
+
+    shift = add_shift(state, parsed)
+
+    assert shift["hours"] == "12"
+    assert shift["pay"] == "180.00"
+    assert total_pay(state) == Decimal("180.00")
+
+
+def test_add_shift_handles_overnight_range():
+    state = make_state()
+    parsed = parse_shift_text("today 10pm-2am 10/h Night shift", default_rate=None)
+
+    shift = add_shift(state, parsed)
+
+    assert shift["hours"] == "4"
+    assert shift["pay"] == "40.00"
+
+
+def test_default_rate_get_and_set():
+    state = make_state()
+    assert get_default_rate(state) is None
+
+    set_default_rate(state, Decimal("18"))
+
+    assert get_default_rate(state) == Decimal("18")
+
+
+def test_combined_summary_and_plan_logic():
+    state = make_state()
+    parsed = parse_shift_text("today 2pm-6pm 15/h Event", default_rate=None)
+    add_shift(state, parsed)
     add_plan(state, "today 2pm-3pm finish report")
-    set_budget(state, "food", Decimal("100"))
 
-    total = total_expenses(state)
     summary = summary_text(state, "today")
 
-    assert total == Decimal("25.5")
-    assert "Expenses: $25.50" in summary
+    assert "This month's pay: $60.00" in summary
     assert "Planned today: 1 open, 0 done" in summary
-    assert "food" in summary.lower()
 
 
 def test_recurring_daily_plan_shows_on_future_dates():
-    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
+    state = make_state()
 
     add_plan(state, "today 8am every day gym")
     future_day = (date.today() + timedelta(days=3)).isoformat()
@@ -68,7 +117,7 @@ def test_plans_starting_soon_within_window():
 
 
 def test_reminder_settings_defaults_and_update():
-    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
+    state = make_state()
 
     cfg = get_reminder_settings(state, 42)
     assert cfg["enabled"] is False
@@ -82,16 +131,17 @@ def test_reminder_settings_defaults_and_update():
 
 
 def test_build_agenda_message_and_csv_export():
-    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
-    add_expense(state, 12, "transport", "bus")
+    state = make_state()
+    parsed = parse_shift_text("today 9am-5pm 12/h Bus shift", default_rate=None)
+    shift = add_shift(state, parsed)
     plan = add_plan(state, "today 9am gym")
 
     agenda = build_agenda_message([plan])
-    csv_text = build_expenses_csv(state)
+    csv_text = build_shifts_csv(state)
 
     assert "gym" in agenda
-    assert "transport" in csv_text
-    assert "12" in csv_text
+    assert "Bus shift" in csv_text
+    assert shift["pay"] in csv_text
 
 
 def test_parse_month_string_variants():
@@ -102,16 +152,16 @@ def test_parse_month_string_variants():
     assert parse_month_string("August 2025") == (2025, 8)
 
 
-def test_build_month_summary_groups_by_category():
-    state = {"expenses": [], "plans": [], "budgets": {}, "incomes": []}
-    add_expense(state, 20, "food", "lunch", expense_date="2026-08-05")
-    add_expense(state, 30, "food", "dinner", expense_date="2026-08-10")
-    add_expense(state, 15, "transport", "bus", expense_date="2026-08-12")
-    add_expense(state, 99, "food", "out of month", expense_date="2026-07-01")
+def test_build_month_summary_totals_pay_and_hours():
+    state = make_state()
+    add_shift(state, parse_shift_text("5/8 9am-5pm 15/h Shift one", default_rate=None))
+    add_shift(state, parse_shift_text("10/8 6pm-10pm 20/h Shift two", default_rate=None))
+    add_shift(state, parse_shift_text("1/7 9am-5pm 15/h Out of month", default_rate=None))
 
     summary = build_month_summary(state, 2026, 8)
 
     assert "August 2026" in summary
-    assert "$65.00" in summary
-    assert "Food: $50.00" in summary
-    assert "Transport: $15.00" in summary
+    assert "$200.00" in summary
+    assert "12h" in summary
+    assert "2 shifts" in summary
+
